@@ -304,6 +304,12 @@ public typealias CompletionHandler = (Throwable?) -> Unit
 public typealias CancellationException = java.util.concurrent.CancellationException
 
 /**
+ * Creates a cancellation exception with a given [message] and [cause].
+ */
+public fun CancellationException(message: String, cause: Throwable) : CancellationException =
+    CancellationException(message).apply { initCause(cause) }
+
+/**
  * Unregisters a specified [registration] when this job is complete.
  *
  * This is a shortcut for the following code with slightly more efficient implementation (one fewer object created).
@@ -472,7 +478,7 @@ public open class JobSupport(active: Boolean) : Job, SelectClause0, SelectClause
     }
 
     private inner class ParentOnCancellation(parent: Job) : JobCancellationNode<Job>(parent) {
-        override fun invokeOnce(reason: Throwable?) { onParentCancellation(reason) }
+        override fun invokeOnce(reason: Throwable?) { onParentCancellation(job, reason) }
         override fun toString(): String = "ParentOnCancellation[${this@JobSupport}]"
     }
 
@@ -480,11 +486,13 @@ public open class JobSupport(active: Boolean) : Job, SelectClause0, SelectClause
      * Invoked at most once on parent completion.
      * @suppress **This is unstable API and it is subject to change.**
      */
-    protected open fun onParentCancellation(cause: Throwable?) {
-        // if parent was completed with CancellationException then use it as the cause of our cancellation, too.
-        // however, we shall not use application specific exceptions here. So if parent crashes due to IOException,
-        // we cannot and should not cancel the child with IOException
-        cancel(cause as? CancellationException)
+    protected open fun onParentCancellation(parent: Job, cause: Throwable?) {
+        // Always materialized the actual instance of paren't completion exception
+        val exception = parent.getCompletionException()
+        // create a new instance of CancellationException with the original exception as cause,
+        // unless the parent was also cancelled, in this case just keep this original exception
+        cancel(exception as? CancellationException ?:
+            JobCancellationException("Parent job has completed", this, exception))
     }
 
     // ------------ state query ------------
@@ -527,10 +535,15 @@ public open class JobSupport(active: Boolean) : Job, SelectClause0, SelectClause
         if (!tryUpdateState(expect, update)) return false
         completeUpdateState(expect, update, mode)
         // if an exceptional completion was suppressed (because cancellation was in progress), then report it separately
-        if (proposedUpdate !== update && proposedUpdate is CompletedExceptionally && proposedUpdate.cause != null)
-            handleException(proposedUpdate.cause)
+        if (proposedUpdate is CompletedExceptionally && proposedUpdate.cause != null && unexpectedCause(proposedUpdate, update)) {
+            handleException(UnexpectedException("Unexpected exception while cancellation is in progress; job=$this", proposedUpdate.cause))
+        }
         return true
     }
+
+    private fun unexpectedCause(proposedUpdate: CompletedExceptionally, update: Any?) =
+        proposedUpdate !== update && (update !is CompletedExceptionally ||
+            proposedUpdate.cause != update.exception) // Equality comparison of exception by design -- see CompletedCancellationExceptions
 
     // when Job is in Cancelling state, it can only be promoted to Cancelled state with the same cause
     // however, null cause can be replaced with more specific CancellationException (that contains stack trace)
@@ -565,7 +578,7 @@ public open class JobSupport(active: Boolean) : Job, SelectClause0, SelectClause
             is JobNode<*> -> try { // SINGLE/SINGLE+ state -- one completion handler (common case)
                 expect.invoke(cause)
             } catch (ex: Throwable) {
-                handleException(ex)
+                handleException(UnexpectedException("Unexpected exception in completion handler $expect for $this", ex))
             }
             is NodeList -> notifyCompletion(expect, cause) // LIST state -- a list of completion handlers
             is Cancelling -> notifyCompletion(expect.list, cause) // has list, too
@@ -583,9 +596,10 @@ public open class JobSupport(active: Boolean) : Job, SelectClause0, SelectClause
             try {
                 node.invoke(cause)
             } catch (ex: Throwable) {
-                exception?.apply { addSuppressed(ex) } ?: run { exception = ex }
+                exception?.apply { addSuppressed(ex) } ?: run {
+                    exception =  UnexpectedException("Unexpected exception in completion handler $node for $this", ex)
+                }
             }
-
         }
         exception?.let { handleException(it) }
     }
@@ -636,9 +650,9 @@ public open class JobSupport(active: Boolean) : Job, SelectClause0, SelectClause
         val state = this.state
         return when (state) {
             is Cancelling -> state.cancelled.exception
-            is Incomplete -> error("Job was not completed or cancelled yet")
+            is Incomplete -> error("Job was not completed or cancelled yet: $this")
             is CompletedExceptionally -> state.exception
-            else -> CancellationException("Job has completed normally")
+            else -> JobCancellationException("Job has completed normally", this)
         }
     }
 
@@ -793,7 +807,7 @@ public open class JobSupport(active: Boolean) : Job, SelectClause0, SelectClause
     // we will be dispatching coroutine to process its cancellation exception, so there is no need for
     // an extra check for Job status in MODE_CANCELLABLE
     private fun updateStateCancelled(state: Incomplete, cause: Throwable?) =
-        updateState(state, Cancelled(cause), mode = MODE_ATOMIC_DEFAULT)
+        updateState(state, Cancelled(this, cause), mode = MODE_ATOMIC_DEFAULT)
 
     // transitions to Cancelled state
     private fun makeCancelled(cause: Throwable?): Boolean {
@@ -822,7 +836,7 @@ public open class JobSupport(active: Boolean) : Job, SelectClause0, SelectClause
                 is NodeList -> { // LIST -- a list of completion handlers (either new or active)
                     if (state.isActive) {
                         // try make it cancelling on the condition that we're still in this state
-                        if (_state.compareAndSet(state, Cancelling(state, Cancelled(cause)))) {
+                        if (_state.compareAndSet(state, Cancelling(state, Cancelled(this, cause)))) {
                             notifyCancellation(state, cause)
                             onCancellation()
                             return true
@@ -863,8 +877,8 @@ public open class JobSupport(active: Boolean) : Job, SelectClause0, SelectClause
     // for nicer debugging
     override fun toString(): String {
         val state = this.state
-        val result = if (state is Incomplete) "" else "[$state]"
-        return "${this::class.java.simpleName}{${stateToString(state)}}$result@${Integer.toHexString(System.identityHashCode(this))}"
+        //val result = if (state is Incomplete) "" else "[$state]"
+        return "${this::class.java.simpleName}{${stateToString(state)}}@${Integer.toHexString(System.identityHashCode(this))}"
     }
 
     /**
@@ -918,7 +932,9 @@ public open class JobSupport(active: Boolean) : Job, SelectClause0, SelectClause
          */
         public val exception: Throwable get() =
             _exception ?: // atomic read volatile var or else create new
-                CancellationException("Job was cancelled").also { _exception = it }
+                createException().also { _exception = it }
+
+        protected open fun createException(): Throwable = error("Completion exception was not specified")
 
         override fun toString(): String = "${this::class.java.simpleName}[$exception]"
     }
@@ -927,9 +943,11 @@ public open class JobSupport(active: Boolean) : Job, SelectClause0, SelectClause
      * A specific subclass of [CompletedExceptionally] for cancelled jobs.
      */
     public class Cancelled(
+        private val job: Job,
         cause: Throwable?
-    ) : CompletedExceptionally(cause)
-
+    ) : CompletedExceptionally(cause) {
+        override fun createException(): Throwable = JobCancellationException("Job was cancelled", job)
+    }
 
     /*
      * =================================================================================================
@@ -1118,3 +1136,16 @@ private class InvokeOnCancellation(
     override fun toString() = "InvokeOnCancellation[${handler::class.java.name}@${Integer.toHexString(System.identityHashCode(handler))}]"
 }
 
+private class UnexpectedException(message: String, cause: Throwable) : RuntimeException(message, cause)
+
+private class JobCancellationException(
+    private val text: String,
+    private val job: Job,
+    cause: Throwable? = null
+) : CancellationException(text) {
+    init { if (cause != null) initCause(cause) }
+    override fun toString(): String = "$text; job=$job"
+    override fun equals(other: Any?): Boolean =
+        other === this || other is JobCancellationException && text == other.text && job == other.job
+    override fun hashCode(): Int = text.hashCode() * 31 + job.hashCode()
+}
